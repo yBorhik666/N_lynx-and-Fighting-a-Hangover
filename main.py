@@ -3,8 +3,10 @@ import math
 import random
 import sys
 import os
+import array
 
 init()
+mixer.init(frequency=44100, size=-16, channels=2, buffer=512)
 
 SCREEN_SIZE = (1360, 800)
 clock = time.Clock()
@@ -23,20 +25,100 @@ ORANGE     = (255, 140, 0)
 LIGHT_BLUE = (100, 180, 255)
 WATER_BLUE = (40,  160, 230)
 ALCO_AMBER = (200, 130, 30)
+GOLD       = (255, 200, 0)
+WALL_COLOR = (80,  70,  50)
+WALL_DARK  = (50,  45,  30)
+MERCHANT_COLOR = (180, 120, 60)
+COLLECTOR_COLOR = (60, 180, 200)
 
 font_big   = font.SysFont("consolas", 48, bold=True)
 font_med   = font.SysFont("consolas", 28)
 font_small = font.SysFont("consolas", 20)
 font_tiny  = font.SysFont("consolas", 15)
 
-# --- ЗАГРУЗКА СПРАЙТОВ ---
-# Положи рядом с game.py:
-#   crate.png, bottle_water.png,
-#   bottle_alco_1.png, bottle_alco_2.png, bottle_alco_3.png
+# ─────────────────────────────────────────────────────────────
+# ЗВУКИ
+# ─────────────────────────────────────────────────────────────
 
+def _make_sound(freq=440, duration_ms=80, volume=0.3, wave_type='square', fade_ms=20):
+    """Генерирует простой звук через pygame без внешних файлов."""
+    sample_rate = 44100
+    n_samples = int(sample_rate * duration_ms / 1000)
+    buf = array.array('h', [0] * n_samples * 2)  # stereo
+    for i in range(n_samples):
+        t = i / sample_rate
+        if wave_type == 'square':
+            val = 1.0 if math.sin(2 * math.pi * freq * t) > 0 else -1.0
+        elif wave_type == 'sine':
+            val = math.sin(2 * math.pi * freq * t)
+        elif wave_type == 'noise':
+            val = random.uniform(-1, 1)
+        else:
+            val = math.sin(2 * math.pi * freq * t)
+        # fade out
+        fade_samples = int(sample_rate * fade_ms / 1000)
+        if i > n_samples - fade_samples:
+            val *= (n_samples - i) / fade_samples
+        s = int(val * 32767 * volume)
+        s = max(-32768, min(32767, s))
+        buf[i * 2]     = s
+        buf[i * 2 + 1] = s
+    snd = mixer.Sound(buffer=buf)
+    return snd
+
+def _make_shoot_from_wav(path):
+    """Загружает wav и делает короткий питч-shifted вариант."""
+    try:
+        snd = mixer.Sound(path)
+        snd.set_volume(0.25)
+        return snd
+    except Exception:
+        return None
+
+# Загружаем m.wav как звук выстрела игрока (ищем в sounds/m.wav, потом рядом)
+_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+_WAV_PATH = os.path.join(_BASE_DIR, "sounds", "m.wav")
+if not os.path.exists(_WAV_PATH):
+    _WAV_PATH = os.path.join(_BASE_DIR, "m.wav")
+if not os.path.exists(_WAV_PATH):
+    _WAV_PATH = "/mnt/user-data/uploads/m.wav"
+
+SND_SHOOT_PLAYER  = _make_shoot_from_wav(_WAV_PATH)
+# Для турели — тот же wav но тише и выше
+SND_SHOOT_TURRET  = _make_shoot_from_wav(_WAV_PATH)
+if SND_SHOOT_TURRET:
+    SND_SHOOT_TURRET.set_volume(0.10)
+
+SND_ENEMY_DIE     = _make_sound(freq=180, duration_ms=120, volume=0.4, wave_type='noise',   fade_ms=60)
+SND_PICKUP_WATER  = _make_sound(freq=660, duration_ms=100, volume=0.3, wave_type='sine',    fade_ms=30)
+SND_PICKUP_ALCO   = _make_sound(freq=440, duration_ms=130, volume=0.3, wave_type='sine',    fade_ms=40)
+SND_PLAYER_HIT    = _make_sound(freq=220, duration_ms=150, volume=0.5, wave_type='square',  fade_ms=50)
+SND_BUY           = _make_sound(freq=880, duration_ms=120, volume=0.4, wave_type='sine',    fade_ms=40)
+SND_COLLECT       = _make_sound(freq=520, duration_ms=80,  volume=0.25, wave_type='sine',   fade_ms=20)
+
+mixer.set_num_channels(32)  # достаточно каналов чтобы каждая пуля имела свой
+
+def play_shoot_player():
+    if SND_SHOOT_PLAYER:
+        ch = mixer.find_channel()
+        if ch:
+            ch.play(SND_SHOOT_PLAYER)
+
+def play_shoot_turret():
+    if SND_SHOOT_TURRET:
+        ch = mixer.find_channel()
+        if ch:
+            ch.play(SND_SHOOT_TURRET)
+
+def play_snd(snd):
+    if snd:
+        snd.play()
+
+# ─────────────────────────────────────────────────────────────
+# ИЗОБРАЖЕНИЯ
+# ─────────────────────────────────────────────────────────────
 def load_img(name, size=None):
     base = os.path.dirname(os.path.abspath(__file__))
-    # Ищем в image/, images/, img/ и рядом с файлом
     for folder in ('image', 'images', 'img', ''):
         path = os.path.join(base, folder, name) if folder else os.path.join(base, name)
         if os.path.exists(path):
@@ -53,16 +135,82 @@ SPR_BOTTLE_A2    = load_img("bottle_alco_2.png",(48, 60))
 SPR_BOTTLE_A3    = load_img("bottle_alco_3.png",(48, 60))
 ALCO_SPRITES     = [s for s in [SPR_BOTTLE_A1, SPR_BOTTLE_A2, SPR_BOTTLE_A3] if s]
 
+# ─────────────────────────────────────────────────────────────
+# СТЕНЫ И ПРОХОДЫ
+# ─────────────────────────────────────────────────────────────
+WALL_THICKNESS = 28
+PASSAGE_WIDTH  = 80
 
+def build_walls():
+    W, H = SCREEN_SIZE
+    hw = PASSAGE_WIDTH // 2
+    cx = W // 2
+    cy = H // 2
+    t  = WALL_THICKNESS
+    walls = []
+    walls.append(Rect(0, 0, cx - hw, t))
+    walls.append(Rect(cx + hw, 0, W - cx - hw, t))
+    walls.append(Rect(0, H - t, cx - hw, t))
+    walls.append(Rect(cx + hw, H - t, W - cx - hw, t))
+    walls.append(Rect(0, 0, t, cy - hw))
+    walls.append(Rect(0, cy + hw, t, H - cy - hw))
+    walls.append(Rect(W - t, 0, t, cy - hw))
+    walls.append(Rect(W - t, cy + hw, t, H - cy - hw))
+    return walls
+
+WALLS = build_walls()
+
+def clamp_to_arena(x, y, radius):
+    for wr in WALLS:
+        nx = max(wr.left, min(x, wr.right))
+        ny = max(wr.top,  min(y, wr.bottom))
+        dist = math.hypot(x - nx, y - ny)
+        if dist < radius:
+            if dist == 0:
+                overlap = radius
+                dx = 1; dy = 0
+            else:
+                overlap = radius - dist
+                dx = (x - nx) / dist
+                dy = (y - ny) / dist
+            x += dx * overlap
+            y += dy * overlap
+    return x, y
+
+def draw_walls(surface):
+    for wr in WALLS:
+        draw.rect(surface, WALL_COLOR, wr)
+        draw.rect(surface, WALL_DARK,  wr, 3)
+        for row in range(0, wr.height, 14):
+            offset = 20 if (row // 14) % 2 == 0 else 0
+            for col in range(offset, wr.width, 40):
+                br = Rect(wr.left + col, wr.top + row,
+                          min(38, wr.width - col), min(12, wr.height - row))
+                if br.width > 2 and br.height > 2:
+                    draw.rect(surface, WALL_DARK, br, 1)
+
+W, H = SCREEN_SIZE
+SPAWN_POINTS = [
+    (W // 2,  -20),
+    (W // 2,  H + 20),
+    (-20,     H // 2),
+    (W + 20,  H // 2),
+]
+
+# ─────────────────────────────────────────────────────────────
+# ПУЛЯ
+# ─────────────────────────────────────────────────────────────
 class Bullet:
-    def __init__(self, x, y, angle):
+    def __init__(self, x, y, angle, speed=14, color=YELLOW, radius=5, from_turret=False):
         self.x, self.y = x, y
         self.angle  = angle
-        self.speed  = 14
-        self.radius = 5
+        self.speed  = speed
+        self.radius = radius
         self.alive  = True
         self.dx = math.cos(angle) * self.speed
         self.dy = math.sin(angle) * self.speed
+        self.color = color
+        self.from_turret = from_turret
 
     def update(self):
         self.x += self.dx; self.y += self.dy
@@ -71,15 +219,411 @@ class Bullet:
             self.alive = False
 
     def draw(self, surface):
-        for i in range(1, 5):
-            tx = self.x - self.dx*i*0.6
-            ty = self.y - self.dy*i*0.6
+        for i in range(1, 4):
+            tx = self.x - self.dx*i*0.5
+            ty = self.y - self.dy*i*0.5
             r  = max(1, self.radius - i)
             draw.circle(surface, (255,230,80), (int(tx), int(ty)), r)
-        draw.circle(surface, YELLOW, (int(self.x), int(self.y)), self.radius)
-        draw.circle(surface, WHITE,  (int(self.x), int(self.y)), self.radius-2)
+        draw.circle(surface, self.color, (int(self.x), int(self.y)), self.radius)
+        draw.circle(surface, WHITE,      (int(self.x), int(self.y)), self.radius-2)
+
+# ─────────────────────────────────────────────────────────────
+# ТУРЕЛЬ
+# ─────────────────────────────────────────────────────────────
+class Turret:
+    BASE_DELAY   = 24
+    RADIUS       = 20
+    MAX_UPGRADES = 5
+    # Базовый разброс турели (в радианах). Уменьшается с каждым апгрейдом.
+    BASE_SCATTER = 0.18   # ~10 градусов
+    SCATTER_PER_UPGRADE = 0.03  # каждый уровень точнее на ~1.7°
+
+    def __init__(self, x, y):
+        self.x, self.y = x, y
+        self.angle    = 0.0
+        self.shoot_cd = 0
+        self.upgrade  = 0
+        self.alive    = True
+        self._shot_count = 0  # для статистики
+
+    @property
+    def shoot_delay(self):
+        return max(3, self.BASE_DELAY >> self.upgrade)
+
+    @property
+    def scatter(self):
+        """Разброс в радианах. 0 = идеальная точность."""
+        sc = self.BASE_SCATTER - self.upgrade * self.SCATTER_PER_UPGRADE
+        return max(0.0, sc)
+
+    @property
+    def accuracy_pct(self):
+        """Точность в % для отображения в HUD."""
+        return int(100 - (self.scatter / self.BASE_SCATTER) * 100)
+
+    def update(self, enemies, bullets_list):
+        if not enemies:
+            return
+        nearest = min(enemies, key=lambda e: math.hypot(e.x-self.x, e.y-self.y))
+        self.angle = math.atan2(nearest.y - self.y, nearest.x - self.x)
+
+        if self.shoot_cd > 0:
+            self.shoot_cd -= 1
+        else:
+            self.shoot_cd = self.shoot_delay
+            # Применяем разброс
+            fire_angle = self.angle + random.uniform(-self.scatter, self.scatter)
+            bx = self.x + math.cos(fire_angle) * (self.RADIUS + 6)
+            by = self.y + math.sin(fire_angle) * (self.RADIUS + 6)
+            bullets_list.append(Bullet(bx, by, fire_angle, speed=12,
+                                        color=(100, 255, 120), from_turret=True))
+            self._shot_count += 1
+            play_shoot_turret()
+
+    def draw(self, surface):
+        draw.ellipse(surface, (20,20,20),
+                     Rect(int(self.x)-self.RADIUS+4, int(self.y)-self.RADIUS//2+8,
+                          self.RADIUS*2, self.RADIUS))
+        base_col = (60, 80, 60)
+        rim_col  = (100, 140, 100)
+        draw.circle(surface, base_col, (int(self.x), int(self.y)), self.RADIUS)
+        draw.circle(surface, rim_col,  (int(self.x), int(self.y)), self.RADIUS, 3)
+        gx = self.x + math.cos(self.angle) * (self.RADIUS + 8)
+        gy = self.y + math.sin(self.angle) * (self.RADIUS + 8)
+        draw.line(surface, DARK_GRAY, (int(self.x), int(self.y)), (int(gx), int(gy)), 7)
+        draw.line(surface, (150, 200, 150), (int(self.x), int(self.y)), (int(gx), int(gy)), 4)
+        for i in range(self.upgrade):
+            sx = self.x - self.RADIUS + i * 8 + 4
+            sy = self.y - self.RADIUS - 8
+            draw.circle(surface, GOLD, (int(sx), int(sy)), 4)
+
+        # Точность над башней
+        acc_lbl = font_tiny.render(f"T{self.upgrade+1} {self.accuracy_pct}%", True, WHITE)
+        surface.blit(acc_lbl, (int(self.x) - acc_lbl.get_width()//2,
+                                int(self.y) - acc_lbl.get_height()//2))
+
+        # Конус разброса (полупрозрачный)
+        if self.scatter > 0.005:
+            cone_len = 80
+            a1 = self.angle - self.scatter
+            a2 = self.angle + self.scatter
+            pts = [
+                (int(self.x), int(self.y)),
+                (int(self.x + math.cos(a1)*cone_len), int(self.y + math.sin(a1)*cone_len)),
+                (int(self.x + math.cos(a2)*cone_len), int(self.y + math.sin(a2)*cone_len)),
+            ]
+            cone_surf = Surface(SCREEN_SIZE, SRCALPHA)
+            draw.polygon(cone_surf, (100, 255, 120, 25), pts)
+            surface.blit(cone_surf, (0, 0))
 
 
+# ─────────────────────────────────────────────────────────────
+# КОЛЛЕКТОР БУТЫЛОК
+# ─────────────────────────────────────────────────────────────
+class Collector:
+    """Дрон, который подбирает бутылки, лежащие дольше PICKUP_TIMEOUT секунд."""
+    RADIUS       = 14
+    SPEED        = 3.5
+    PICKUP_TIMEOUT = 10.0   # секунд до того, как бутылка считается «забытой»
+    REST_X       = SCREEN_SIZE[0] // 2 + 120
+    REST_Y       = SCREEN_SIZE[1] // 2 + 80
+
+    def __init__(self):
+        self.x   = float(self.REST_X)
+        self.y   = float(self.REST_Y)
+        self.target_bottle = None
+        self.bob  = 0.0
+        self.collected = 0
+        self.state = 'idle'   # idle | flying | returning
+
+    def update(self, bottles, player, dt):
+        self.bob += 0.06
+
+        # Найти самую «старую» бутылку
+        expired = [b for b in bottles if b.alive and b.age >= self.PICKUP_TIMEOUT]
+        if expired and self.state == 'idle':
+            self.target_bottle = min(expired, key=lambda b: b.age, default=None)
+            if self.target_bottle:
+                self.state = 'flying'
+
+        if self.state == 'flying' and self.target_bottle:
+            if not self.target_bottle.alive:
+                self.target_bottle = None
+                self.state = 'returning'
+            else:
+                tx, ty = self.target_bottle.x, self.target_bottle.y
+                dist = math.hypot(tx - self.x, ty - self.y)
+                if dist < self.RADIUS + Bottle.RADIUS:
+                    # Подобрали
+                    self.target_bottle.alive = False
+                    player.pick_bottle(self.target_bottle)
+                    self.collected += 1
+                    play_snd(SND_COLLECT)
+                    self.target_bottle = None
+                    self.state = 'returning'
+                else:
+                    self.x += (tx - self.x) / dist * self.SPEED
+                    self.y += (ty - self.y) / dist * self.SPEED
+
+        elif self.state == 'returning':
+            dist = math.hypot(self.REST_X - self.x, self.REST_Y - self.y)
+            if dist < 4:
+                self.x, self.y = self.REST_X, self.REST_Y
+                self.state = 'idle'
+            else:
+                self.x += (self.REST_X - self.x) / dist * self.SPEED
+                self.y += (self.REST_Y - self.y) / dist * self.SPEED
+
+    def draw(self, surface):
+        bob_dy = math.sin(self.bob) * 4
+        px, py = int(self.x), int(self.y + bob_dy)
+
+        # Тень
+        draw.ellipse(surface, (20, 20, 20),
+                     Rect(px - self.RADIUS + 4, py + self.RADIUS - 4, self.RADIUS * 2, 8))
+
+        # Корпус дрона
+        draw.circle(surface, COLLECTOR_COLOR, (px, py), self.RADIUS)
+        draw.circle(surface, (120, 220, 240), (px, py), self.RADIUS, 2)
+
+        # Лопасти (4 штуки)
+        for ang in [0, math.pi/2, math.pi, 3*math.pi/2]:
+            bx = px + int(math.cos(ang + self.bob*0.5) * (self.RADIUS + 6))
+            by = py + int(math.sin(ang + self.bob*0.5) * (self.RADIUS + 6))
+            draw.circle(surface, (80, 180, 200), (bx, by), 4)
+            draw.line(surface, (80, 180, 200), (px, py), (bx, by), 2)
+
+        # Значок «↓» в центре
+        lbl = font_tiny.render("↓", True, WHITE)
+        surface.blit(lbl, (px - lbl.get_width()//2, py - lbl.get_height()//2))
+
+        # Линия к цели
+        if self.target_bottle and self.target_bottle.alive:
+            draw.line(surface, (60, 200, 220),
+                      (px, py),
+                      (int(self.target_bottle.x), int(self.target_bottle.y)), 1)
+
+        # Счётчик собранного
+        cnt = font_tiny.render(f"↓{self.collected}", True, COLLECTOR_COLOR)
+        surface.blit(cnt, (px - cnt.get_width()//2, py - self.RADIUS - 14))
+
+
+# ─────────────────────────────────────────────────────────────
+# ТОРГОВЕЦ
+# ─────────────────────────────────────────────────────────────
+class Merchant:
+    RADIUS      = 22
+    INTERACT_R  = 80
+
+    TURRET_BASE_PRICE = 25
+    HP_PRICE          = 20
+    SOBER_PRICE       = 15   # снять эффект слепоты/пьянства
+
+    def __init__(self):
+        self.x = SCREEN_SIZE[0] // 2
+        self.y = SCREEN_SIZE[1] // 2 + 80
+        self.angle  = 0.0
+        self.bob    = 0.0
+        self.alive  = True
+        self.shop_open = False
+        self.turret_level  = 0
+        self.turret_placed = False
+
+    def turret_price(self):
+        return self.TURRET_BASE_PRICE * (2 ** self.turret_level)
+
+    def turret_upgrade_price(self):
+        next_lvl = self.turret_level + 1
+        return self.TURRET_BASE_PRICE * (2 ** next_lvl)
+
+    def update(self, player):
+        self.bob += 0.04
+        dist = math.hypot(player.x - self.x, player.y - self.y)
+        self.shop_open = dist < self.INTERACT_R
+
+    def draw(self, surface):
+        bob_dy = math.sin(self.bob) * 3
+        px, py = int(self.x), int(self.y + bob_dy)
+        draw.ellipse(surface, (20,20,20),
+                     Rect(px-self.RADIUS+4, py-self.RADIUS//2+8, self.RADIUS*2, self.RADIUS))
+        draw.circle(surface, MERCHANT_COLOR, (px, py), self.RADIUS)
+        draw.circle(surface, (220, 160, 80), (px, py), self.RADIUS, 3)
+        for ex, ey in [(-7, -6), (7, -6)]:
+            draw.circle(surface, WHITE, (px+ex, py+ey), 5)
+            draw.circle(surface, BLACK, (px+ex+1, py+ey+1), 3)
+        draw.circle(surface, GOLD, (px+self.RADIUS-4, py-4), 7)
+        draw.circle(surface, (200,160,0), (px+self.RADIUS-4, py-4), 7, 2)
+        dollar = font_tiny.render("$", True, BLACK)
+        surface.blit(dollar, (px+self.RADIUS-8, py-9))
+        name = font_tiny.render("ТОРГОВЕЦ", True, GOLD)
+        surface.blit(name, (px - name.get_width()//2, py - self.RADIUS - 18))
+        draw.circle(surface, (180,150,80,60), (px, py), self.INTERACT_R, 1)
+
+    def draw_shop(self, surface, player, turrets):
+        sw, sh = 460, 440
+        sx = SCREEN_SIZE[0]//2 - sw//2
+        sy = SCREEN_SIZE[1]//2 - sh//2 - 60
+
+        panel = Surface((sw, sh), SRCALPHA)
+        panel.fill((20, 18, 12, 220))
+        draw.rect(panel, GOLD, Rect(0, 0, sw, sh), 3, border_radius=10)
+        surface.blit(panel, (sx, sy))
+
+        title = font_med.render("[ МАГАЗИН ]", True, GOLD)
+        surface.blit(title, (sx + sw//2 - title.get_width()//2, sy + 12))
+
+        score_lbl = font_small.render(f"Ваш счёт: {player.score}", True, YELLOW)
+        surface.blit(score_lbl, (sx + 14, sy + 50))
+
+        # Точность турелей (если куплены)
+        if turrets:
+            acc = turrets[0].accuracy_pct
+            scatter_deg = round(math.degrees(turrets[0].scatter), 1)
+            acc_lbl = font_tiny.render(
+                f"Точность турелей: {acc}%  (разброс ±{scatter_deg}°)", True, LIGHT_BLUE)
+            surface.blit(acc_lbl, (sx + 14, sy + 74))
+            item_start_y = 96
+        else:
+            item_start_y = 80
+
+        items = self._get_items(player, turrets)
+        for i, item in enumerate(items):
+            iy = sy + item_start_y + i * 72
+            row_surf = Surface((sw - 20, 62), SRCALPHA)
+            row_surf.fill((40, 35, 20, 180) if item['can_buy'] else (30, 25, 20, 120))
+            draw.rect(row_surf, (100, 85, 40), Rect(0, 0, sw-20, 62), 2, border_radius=6)
+            surface.blit(row_surf, (sx + 10, iy))
+
+            ic_col = item.get('icon_color', GRAY)
+            draw.circle(surface, ic_col, (sx + 34, iy + 31), 16)
+
+            nm = font_small.render(item['name'], True, WHITE if item['can_buy'] else GRAY)
+            surface.blit(nm, (sx + 58, iy + 6))
+            desc = font_tiny.render(item['desc'], True, (180, 170, 140))
+            surface.blit(desc, (sx + 58, iy + 30))
+
+            price_col = GOLD if item['can_buy'] else RED
+            pr = font_small.render(f"{item['price']} очков", True, price_col)
+            surface.blit(pr, (sx + sw - pr.get_width() - 16, iy + 20))
+
+        key_hint = font_tiny.render(
+            "1-Турели  2-Прокачка  3-HP  4-Протрезвление  E-закрыть",
+            True, (160, 150, 100))
+        surface.blit(key_hint, (sx + sw//2 - key_hint.get_width()//2, sy + sh - 26))
+
+    def _get_items(self, player, turrets):
+        items = []
+        tp = self.turret_price()
+        action_name = "Купить турели (x4)" if not self.turret_placed else "Переставить турели"
+        items.append({
+            'name': action_name,
+            'desc': f"Ставит 4 турели по углам  (уровень {self.turret_level+1})",
+            'price': tp,
+            'can_buy': player.score >= tp,
+            'key': '1',
+            'icon_color': (100, 200, 100),
+        })
+        if self.turret_placed and self.turret_level < Turret.MAX_UPGRADES:
+            up = self.turret_upgrade_price()
+            next_acc = int(100 - max(0.0, Turret.BASE_SCATTER - (self.turret_level+1)*Turret.SCATTER_PER_UPGRADE) / Turret.BASE_SCATTER * 100)
+            items.append({
+                'name': f"Прокачать турели → ур.{self.turret_level+2}",
+                'desc': f"Скорострельность x2, точность → {next_acc}%",
+                'price': up,
+                'can_buy': player.score >= up,
+                'key': '2',
+                'icon_color': GOLD,
+            })
+        else:
+            items.append({
+                'name': "Прокачка недоступна",
+                'desc': "Макс. уровень" if self.turret_level >= Turret.MAX_UPGRADES else "Сначала купите турели",
+                'price': 0,
+                'can_buy': False,
+                'key': '2',
+                'icon_color': GRAY,
+            })
+        items.append({
+            'name': f"Восстановить HP (+1)",
+            'desc': f"Лечит 1 единицу здоровья (макс {player.max_hp})",
+            'price': self.HP_PRICE,
+            'can_buy': player.score >= self.HP_PRICE and player.hp < player.max_hp,
+            'key': '3',
+            'icon_color': RED,
+        })
+        # Протрезвление — снять слепоту
+        drunk = player.alco.value >= 8.0
+        items.append({
+            'name': "Протрезвление",
+            'desc': "Сбрасывает алкоголь до 4.0, снимает слепоту и тряску",
+            'price': self.SOBER_PRICE,
+            'can_buy': player.score >= self.SOBER_PRICE and drunk,
+            'key': '4',
+            'icon_color': (80, 200, 255) if drunk else GRAY,
+            'active': drunk,
+        })
+        return items
+
+    def try_buy_turrets(self, player, turrets):
+        tp = self.turret_price()
+        if player.score < tp:
+            return False
+        player.score -= tp
+        turrets.clear()
+        margin = WALL_THICKNESS + 40
+        W, H   = SCREEN_SIZE
+        corners = [
+            (margin, margin),
+            (W - margin, margin),
+            (margin, H - margin),
+            (W - margin, H - margin),
+        ]
+        for cx2, cy2 in corners:
+            t = Turret(cx2, cy2)
+            t.upgrade = self.turret_level
+            turrets.append(t)
+        self.turret_placed = True
+        play_snd(SND_BUY)
+        return True
+
+    def try_upgrade_turrets(self, player, turrets):
+        if self.turret_level >= Turret.MAX_UPGRADES:
+            return False
+        up = self.turret_upgrade_price()
+        if player.score < up:
+            return False
+        player.score -= up
+        self.turret_level += 1
+        for t in turrets:
+            t.upgrade = self.turret_level
+        play_snd(SND_BUY)
+        return True
+
+    def try_buy_hp(self, player):
+        if player.score < self.HP_PRICE or player.hp >= player.max_hp:
+            return False
+        player.score -= self.HP_PRICE
+        player.hp = min(player.max_hp, player.hp + 1)
+        play_snd(SND_BUY)
+        return True
+
+    def try_sober(self, player):
+        """Снимает эффект пьянства/слепоты — сбрасывает алкоголь до 4.0."""
+        if player.score < self.SOBER_PRICE or player.alco.value < 8.0:
+            return False
+        player.score -= self.SOBER_PRICE
+        player.alco.value = 4.0
+        player.shake_x = 0
+        player.shake_y = 0
+        player.blind_pulse = 0
+        player.sober_flash = 30   # ~0.5 сек вспышки
+        play_snd(SND_BUY)
+        return True
+
+
+# ─────────────────────────────────────────────────────────────
+# ЯЩИК / БУТЫЛКА / ВРАГ / ЧАСТИЦА
+# ─────────────────────────────────────────────────────────────
 class Crate:
     SIZE = 48
 
@@ -120,6 +664,7 @@ class Bottle:
         self.x, self.y = x, y
         self.kind  = kind
         self.alive = True
+        self.age   = 0.0    # секунд на земле
         if kind == "water":
             self.sprite = SPR_BOTTLE_WATER
             self.color  = WATER_BLUE
@@ -128,9 +673,21 @@ class Bottle:
             self.color  = ALCO_AMBER
         self.bob = random.uniform(0, math.pi*2)
 
+    def update(self, dt):
+        self.age += dt
+
     def draw(self, surface):
         self.bob += 0.05
         dy_bob = math.sin(self.bob) * 2
+
+        # Мигание при возрасте > 7 сек (предупреждение о сборе коллектором)
+        if self.age > 7.0:
+            blink_fast = int(self.age * 8) % 2 == 0
+            if blink_fast:
+                # Рисуем кружок-предупреждение
+                draw.circle(surface, COLLECTOR_COLOR,
+                            (int(self.x), int(self.y + dy_bob)), self.RADIUS + 5, 2)
+
         if self.sprite:
             rx = self.x - self.sprite.get_width()//2
             ry = self.y - self.sprite.get_height()//2 + dy_bob
@@ -142,14 +699,18 @@ class Bottle:
             surface.blit(lbl, (int(self.x)-lbl.get_width()//2,
                                 int(self.y+dy_bob)-lbl.get_height()//2))
 
+        # Таймер «осталось до коллектора»
+        if self.age > 5.0:
+            remain = max(0.0, Collector.PICKUP_TIMEOUT - self.age)
+            timer_lbl = font_tiny.render(f"{remain:.1f}s", True, COLLECTOR_COLOR)
+            surface.blit(timer_lbl, (int(self.x) - timer_lbl.get_width()//2,
+                                      int(self.y) - self.RADIUS - 16))
+
 
 class Enemy:
     def __init__(self):
-        side = random.randint(0,3)
-        if   side==0: self.x,self.y = random.randint(0,SCREEN_SIZE[0]), -30
-        elif side==1: self.x,self.y = random.randint(0,SCREEN_SIZE[0]), SCREEN_SIZE[1]+30
-        elif side==2: self.x,self.y = -30, random.randint(0,SCREEN_SIZE[1])
-        else:         self.x,self.y = SCREEN_SIZE[0]+30, random.randint(0,SCREEN_SIZE[1])
+        sp = random.choice(SPAWN_POINTS)
+        self.x, self.y = sp
         self.speed  = random.uniform(1.5, 3.0)
         self.radius = 20
         self.hp     = 2
@@ -161,6 +722,7 @@ class Enemy:
         if d > 0:
             self.x += dx/d*self.speed
             self.y += dy/d*self.speed
+        self.x, self.y = clamp_to_arena(self.x, self.y, self.radius)
 
     def draw(self, surface):
         draw.ellipse(surface,(20,20,20),
@@ -201,7 +763,6 @@ class Particle:
 
 
 class SpeechBubble:
-    """Облачко с текстом над персонажем."""
     LINES = [
         "Мама, мне плохо!",
         "Где моя бутылочка?",
@@ -211,18 +772,16 @@ class SpeechBubble:
 
     def __init__(self):
         self.text        = ""
-        self.timer       = 0.0   # сколько ещё показывать (сек)
-        self.prev_alco   = -1.0  # предыдущее значение alco
-        self.bob         = 0.0   # покачивание облачка
-        self.drop_accum  = 0.0   # накопленное падение с последнего показа
+        self.timer       = 0.0
+        self.prev_alco   = -1.0
+        self.bob         = 0.0
+        self.drop_accum  = 0.0
 
     def update(self, alco_value, dt):
-        # Накапливаем сколько упало с прошлого кадра
         if self.prev_alco >= 0 and alco_value < self.prev_alco:
             self.drop_accum += self.prev_alco - alco_value
         self.prev_alco = alco_value
 
-        # Показываем надпись каждые 0.5 единицы падения
         if self.drop_accum >= 0.5:
             self.drop_accum -= 0.5
             self.text  = random.choice(self.LINES)
@@ -241,18 +800,14 @@ class SpeechBubble:
         bw = txt_surf.get_width()  + padding * 2
         bh = txt_surf.get_height() + padding * 2
 
-        # Позиция: правее и выше персонажа, чуть покачивается
         bob_dy = math.sin(self.bob) * 3
         bx = int(px) + 30
         by = int(py) - 60 + int(bob_dy)
 
-        # Не выходить за правый край
         if bx + bw > SCREEN_SIZE[0] - 5:
             bx = int(px) - bw - 30
 
-        # Прозрачность: fade-out в последнюю секунду
         alpha = min(255, int(255 * min(self.timer, 1.0)))
-
         bubble = Surface((bw, bh), SRCALPHA)
         bubble.fill((255, 255, 255, alpha))
         bubble_rect = Rect(0, 0, bw, bh)
@@ -260,13 +815,11 @@ class SpeechBubble:
         bubble.blit(txt_surf, (padding, padding))
         surface.blit(bubble, (bx, by))
 
-        # Хвостик (треугольник)
         tip_x = bx + 20
         tip_y = by + bh
         tail_surf = Surface((30, 14), SRCALPHA)
-        gfxdraw_pts = [(0, 0), (20, 0), (5, 13)]
-        draw.polygon(tail_surf, (255, 255, 255, alpha), gfxdraw_pts)
-        draw.polygon(tail_surf, (200, 200, 200, alpha), gfxdraw_pts, 1)
+        draw.polygon(tail_surf, (255, 255, 255, alpha), [(0,0),(20,0),(5,13)])
+        draw.polygon(tail_surf, (200, 200, 200, alpha), [(0,0),(20,0),(5,13)], 1)
         surface.blit(tail_surf, (tip_x - 5, tip_y - 1))
 
 
@@ -301,9 +854,12 @@ class NeedBar:
         surface.blit(lbl, (x+5, y+2))
 
 
+# ─────────────────────────────────────────────────────────────
+# ИГРОК
+# ─────────────────────────────────────────────────────────────
 class Player:
     def __init__(self):
-        self.x, self.y  = SCREEN_SIZE[0]//2, SCREEN_SIZE[1]//2
+        self.x, self.y  = SCREEN_SIZE[0]//2, SCREEN_SIZE[1]//2 - 60
         self.speed       = 5
         self.radius      = 22
         self.angle       = 0
@@ -313,12 +869,14 @@ class Player:
         self.shoot_delay = 12
         self.invincible  = 0
         self.alive       = True
+        self.score       = 0
         self.h2o  = NeedBar("H2O",    WATER_BLUE, start=7.0)
         self.alco = NeedBar("C2H5OH", ALCO_AMBER, start=3.0)
         self.dehydr_timer = 0.0
         self.shake_x = self.shake_y = 0
         self.blind_pulse  = 0
         self.bubble        = SpeechBubble()
+        self.sober_flash   = 0   # кадров оставшейся вспышки после протрезвления
 
     def update(self, keys, mx, my, dt):
         drunk = self.alco.value >= 8.0
@@ -335,8 +893,11 @@ class Player:
         if keys[K_d] or keys[K_RIGHT]: dx += self.speed
         if dx and dy: dx*=0.707; dy*=0.707
 
-        self.x = max(self.radius, min(SCREEN_SIZE[0]-self.radius, self.x+dx))
-        self.y = max(self.radius, min(SCREEN_SIZE[1]-self.radius, self.y+dy))
+        nx = self.x + dx
+        ny = self.y + dy
+        nx, ny = clamp_to_arena(nx, ny, self.radius)
+        self.x, self.y = nx, ny
+
         self.angle = math.atan2((my+self.shake_y)-self.y, (mx+self.shake_x)-self.x)
 
         if self.shoot_cd   > 0: self.shoot_cd   -= 1
@@ -367,6 +928,7 @@ class Player:
                 scatter = 0.0
             angle = self.angle + random.uniform(-scatter, scatter)
             self.shoot_cd = self.shoot_delay
+            play_shoot_player()
             return Bullet(self.x + math.cos(angle)*(self.radius+8),
                           self.y + math.sin(angle)*(self.radius+8), angle)
         return None
@@ -375,13 +937,16 @@ class Player:
         if self.invincible == 0:
             self.hp -= 1
             self.invincible = 60
+            play_snd(SND_PLAYER_HIT)
             if self.hp <= 0: self.alive = False
 
     def pick_bottle(self, bottle):
         if bottle.kind == "water":
             self.h2o.add(3.0)
+            play_snd(SND_PICKUP_WATER)
         else:
             self.alco.add(random.uniform(1.5, 3.0))
+            play_snd(SND_PICKUP_ALCO)
 
     def draw(self, surface):
         blink = self.invincible > 0 and (self.invincible//5)%2 == 0
@@ -400,10 +965,12 @@ class Player:
         vx = self.x+sx + math.cos(self.angle)*(self.radius-6)
         vy = self.y+sy + math.sin(self.angle)*(self.radius-6)
         draw.circle(surface, LIGHT_BLUE,(int(vx),int(vy)),6)
-        # Облачко с репликой
         self.bubble.draw(surface, self.x + self.shake_x, self.y + self.shake_y)
 
 
+# ─────────────────────────────────────────────────────────────
+# HUD И ВСПОМОГАТЕЛЬНОЕ
+# ─────────────────────────────────────────────────────────────
 def apply_blur(surface, strength=6):
     sw = max(1, SCREEN_SIZE[0]//strength)
     sh = max(1, SCREEN_SIZE[1]//strength)
@@ -412,7 +979,7 @@ def apply_blur(surface, strength=6):
     surface.blit(blurred,(0,0))
 
 
-def draw_hud(surface, player, score, wave):
+def draw_hud(surface, player, wave, merchant, turrets, collector):
     hp_w=200; hp_h=18; hp_x=20; hp_y=20
     draw.rect(surface, DARK_GRAY, Rect(hp_x,hp_y,hp_w,hp_h), border_radius=6)
     fw = int(hp_w * max(0,player.hp)/player.max_hp)
@@ -433,14 +1000,36 @@ def draw_hud(surface, player, score, wave):
         warn_y += 22
     if player.alco.value >= 8:
         surface.blit(font_small.render("!! СЛЕПОТА от алкоголя!", True, ALCO_AMBER),(20,warn_y))
+        warn_y += 22
 
-    surface.blit(font_med.render(f"Счёт: {score}",True,YELLOW),(SCREEN_SIZE[0]-180,15))
+    # Информация о коллекторе
+    col_state = {"idle": "ожидает", "flying": "летит!", "returning": "возвращается"}.get(collector.state, "")
+    col_lbl = font_tiny.render(
+        f"Коллектор: {col_state}  собрано: {collector.collected}",
+        True, COLLECTOR_COLOR)
+    surface.blit(col_lbl, (20, warn_y))
+
+    # Точность турелей (мини-инфо)
+    if turrets:
+        acc = turrets[0].accuracy_pct
+        sc_deg = round(math.degrees(turrets[0].scatter), 1)
+        tl = font_tiny.render(
+            f"Турели: {len(turrets)} шт  точность {acc}%  ±{sc_deg}°",
+            True, (100, 220, 120))
+        surface.blit(tl, (20, warn_y + 18))
+
+    surface.blit(font_med.render(f"Счёт: {player.score}", True, YELLOW),(SCREEN_SIZE[0]-200,15))
     ws = font_small.render(f"Волна: {wave}",True,LIGHT_BLUE)
     surface.blit(ws,(SCREEN_SIZE[0]//2 - ws.get_width()//2, 15))
+
     hint = font_tiny.render(
-        "WASD -- движение  |  ЛКМ -- стрелять  |  бутылки подбираются автоматически  |  ESC -- выход",
+        "WASD -- движение  |  ЛКМ -- стрелять  |  у торговца: 1/2/3/4 -- покупка  |  ESC -- выход",
         True, GRAY)
     surface.blit(hint,(SCREEN_SIZE[0]//2 - hint.get_width()//2, SCREEN_SIZE[1]-22))
+
+    if merchant.shop_open:
+        tip = font_small.render("[ МАГАЗИН ОТКРЫТ ]", True, GOLD)
+        surface.blit(tip, (SCREEN_SIZE[0]//2 - tip.get_width()//2, SCREEN_SIZE[1]//2 - 180))
 
 
 def draw_grid(surface):
@@ -462,6 +1051,9 @@ def game_over_screen(surface, score):
         surface.blit(surf,(cx-surf.get_width()//2, cy+yo))
 
 
+# ─────────────────────────────────────────────────────────────
+# ГЛАВНЫЙ ЦИКЛ
+# ─────────────────────────────────────────────────────────────
 def main():
     player      = Player()
     bullets     = []
@@ -469,7 +1061,9 @@ def main():
     crates      = []
     bottles     = []
     particles   = []
-    score       = 0
+    turrets     = []
+    merchant    = Merchant()
+    collector   = Collector()
     wave        = 1
     enemy_timer = 0
     spawn_rate  = 90
@@ -486,28 +1080,45 @@ def main():
             if e.type == QUIT: quit(); sys.exit()
             if e.type == KEYDOWN:
                 if e.key == K_ESCAPE: quit(); sys.exit()
-                if e.key == K_r and game_state=="dead": main(); return
+                if e.key == K_r and game_state == "dead":
+                    main(); return
 
-        if mouse.get_pressed()[0] and game_state=="play":
+                if game_state == "play" and merchant.shop_open:
+                    if e.key == K_1:
+                        merchant.try_buy_turrets(player, turrets)
+                    elif e.key == K_2:
+                        merchant.try_upgrade_turrets(player, turrets)
+                    elif e.key == K_3:
+                        merchant.try_buy_hp(player)
+                    elif e.key == K_4:
+                        merchant.try_sober(player)
+
+        if mouse.get_pressed()[0] and game_state == "play":
             b = player.try_shoot()
             if b: bullets.append(b)
 
         if game_state == "play":
             player.update(keys, mx, my, dt)
+            merchant.update(player)
+            collector.update(bottles, player, dt)
 
             enemy_timer += 1
             if enemy_timer >= spawn_rate:
                 enemy_timer = 0
                 enemies.append(Enemy())
-                if score > 0 and score % 10 == 0:
+                if player.score > 0 and player.score % 10 == 0:
                     wave += 1
-                    spawn_rate = max(30, spawn_rate-5)
+                    spawn_rate = max(30, spawn_rate - 5)
+
+            for t in turrets:
+                t.update(enemies, bullets)
 
             for b in bullets: b.update()
             bullets = [b for b in bullets if b.alive]
 
             for en in enemies:
                 en.update(player.x, player.y)
+
                 for b in bullets:
                     if b.alive and math.hypot(b.x-en.x, b.y-en.y) < en.radius+b.radius:
                         b.alive = False
@@ -515,13 +1126,16 @@ def main():
                         for _ in range(8): particles.append(Particle(b.x,b.y,(255,100,50)))
                         if en.hp <= 0:
                             en.alive = False
-                            score   += 1
+                            player.score += 1
+                            play_snd(SND_ENEMY_DIE)
                             for _ in range(15): particles.append(Particle(en.x,en.y,(220,50,50)))
                             drop = en.drop()
                             if drop: crates.append(drop)
+
                 if math.hypot(en.x-player.x, en.y-player.y) < en.radius+player.radius:
                     player.take_damage()
                     for _ in range(10): particles.append(Particle(player.x,player.y,(80,130,255)))
+
             enemies = [en for en in enemies if en.alive]
 
             for cr in crates:
@@ -533,8 +1147,12 @@ def main():
                         for _ in range(12): particles.append(Particle(cr.x,cr.y,(160,110,40)))
             crates = [cr for cr in crates if cr.alive]
 
+            # Обновляем возраст бутылок
             for bt in bottles:
-                if math.hypot(bt.x-player.x, bt.y-player.y) < player.radius+Bottle.RADIUS:
+                bt.update(dt)
+            # Игрок подбирает бутылки
+            for bt in bottles:
+                if bt.alive and math.hypot(bt.x-player.x, bt.y-player.y) < player.radius+Bottle.RADIUS:
                     bt.alive = False
                     player.pick_bottle(bt)
             bottles = [bt for bt in bottles if bt.alive]
@@ -544,13 +1162,20 @@ def main():
 
             if not player.alive: game_state = "dead"
 
+        # ── Отрисовка ──
         w.fill((15,22,15))
         draw_grid(w)
+        draw_walls(w)
+
         for cr in crates:    cr.draw(w)
         for bt in bottles:   bt.draw(w)
         for p  in particles:  p.draw(w)
         for en in enemies:   en.draw(w)
+        for t  in turrets:   t.draw(w)
         for b  in bullets:   b.draw(w)
+
+        collector.draw(w)
+        merchant.draw(w)
 
         if game_state == "play":
             player.draw(w)
@@ -563,8 +1188,24 @@ def main():
             vignette.fill((200,160,0,alpha))
             w.blit(vignette,(0,0))
 
-        draw_hud(w, player, score, wave)
-        if game_state == "dead": game_over_screen(w, score)
+        # Вспышка протрезвления
+        if player.sober_flash > 0:
+            fl_alpha = int(180 * player.sober_flash / 30)
+            flash = Surface(SCREEN_SIZE, SRCALPHA)
+            flash.fill((80, 220, 255, fl_alpha))
+            w.blit(flash, (0, 0))
+            sober_lbl = font_med.render("ПРОТРЕЗВЕЛ!", True, WHITE)
+            w.blit(sober_lbl, (SCREEN_SIZE[0]//2 - sober_lbl.get_width()//2,
+                                SCREEN_SIZE[1]//2 - 120))
+            player.sober_flash -= 1
+
+        draw_hud(w, player, wave, merchant, turrets, collector)
+
+        if merchant.shop_open and game_state == "play":
+            merchant.draw_shop(w, player, turrets)
+
+        if game_state == "dead":
+            game_over_screen(w, player.score)
 
         if game_state == "play":
             cx = mx + player.shake_x
