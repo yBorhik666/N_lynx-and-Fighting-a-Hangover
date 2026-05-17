@@ -138,6 +138,42 @@ SPR_BOTTLE_A3    = load_img("bottle_alco_3.png",(48, 60))
 ALCO_SPRITES     = [s for s in [SPR_BOTTLE_A1, SPR_BOTTLE_A2, SPR_BOTTLE_A3] if s]
 SPR_PLAYER       = load_img("N_lynx.png", (72, 72))
 
+# Загрузка нового спрайта: вырезаем круг из центра изображения
+def _load_player_sprite(name, diameter=72):
+    base = os.path.dirname(os.path.abspath(__file__))
+    path = None
+    for folder in ('image', 'images', 'img', ''):
+        p = os.path.join(base, folder, name) if folder else os.path.join(base, name)
+        if os.path.exists(p):
+            path = p; break
+    if path is None:
+        up = os.path.join("/mnt/user-data/uploads", name)
+        if os.path.exists(up):
+            path = up
+    if path is None:
+        return None
+    try:
+        raw = image.load(path).convert_alpha()
+        rw, rh = raw.get_size()
+        side = min(rw, rh)
+        cx   = (rw - side) // 2
+        cy   = (rh - side) // 2
+        crop = Surface((side, side), SRCALPHA)
+        crop.blit(raw, (0, 0), Rect(cx, cy, side, side))
+        scaled = transform.smoothscale(crop, (diameter, diameter))
+        result = Surface((diameter, diameter), SRCALPHA)
+        result.fill((0, 0, 0, 0))
+        draw.circle(result, (255, 255, 255, 255), (diameter // 2, diameter // 2), diameter // 2)
+        result.blit(scaled, (0, 0), special_flags=BLEND_RGBA_MULT)
+        return result
+    except Exception:
+        return None
+
+_SPR_PLAYER_NEW = _load_player_sprite(
+    "player.png", diameter=72)
+if _SPR_PLAYER_NEW:
+    SPR_PLAYER = _SPR_PLAYER_NEW
+
 # Иконки скиллов: ищем рядом с игрой, fallback — uploads
 def _load_skill_icon(name, size=(52, 52)):
     base = os.path.dirname(os.path.abspath(__file__))
@@ -1184,23 +1220,42 @@ class Player:
                           py - self.radius // 2 + 10,
                           self.radius * 2, self.radius))
 
+        # Цвета оружия под палитру персонажа (тёплые: красный+тёмно-коричневый)
+        GUN_DARK  = (60, 20, 15)      # тёмно-коричневый ствол
+        GUN_MID   = (120, 40, 30)     # средний тон ствола
+        GUN_TIP   = (212, 33, 37)     # красный акцент — дуло
+
         if SPR_PLAYER:
-            # Поворачиваем спрайт по углу прицела и рисуем
-            angle_deg = -math.degrees(self.angle)
-            rotated   = transform.rotate(SPR_PLAYER, angle_deg)
-            rr        = rotated.get_rect(center=(px, py))
-            surface.blit(rotated, rr)
+            # SPR_PLAYER уже является готовым круглым SRCALPHA-спрайтом
+            # (сформирован в _load_player_sprite), просто блитим его
+            r    = self.radius
+            diam = r * 2
+            spr_w, spr_h = SPR_PLAYER.get_size()
+            if spr_w != diam or spr_h != diam:
+                scaled_spr = transform.smoothscale(SPR_PLAYER, (diam, diam))
+            else:
+                scaled_spr = SPR_PLAYER
+            surface.blit(scaled_spr, (px - r, py - r))
+
+            # Обводка: тонкое кольцо в цвет красного акцента
+            draw.circle(surface, GUN_TIP, (px, py), r, 2)
+
         else:
-            # Fallback: геометрия
-            draw.circle(surface, (60, 140, 255), (px, py), self.radius)
-            draw.circle(surface, (100, 180, 255), (px, py), self.radius, 3)
-            gx = self.x + sx + math.cos(self.angle) * 28
-            gy = self.y + sy + math.sin(self.angle) * 28
-            draw.line(surface, DARK_GRAY, (px, py), (int(gx), int(gy)), 7)
-            draw.line(surface, GRAY,      (px, py), (int(gx), int(gy)), 4)
-            vx = self.x + sx + math.cos(self.angle) * (self.radius - 6)
-            vy = self.y + sy + math.sin(self.angle) * (self.radius - 6)
-            draw.circle(surface, LIGHT_BLUE, (int(vx), int(vy)), 6)
+            # Fallback: геометрия (круг) в тёплых тонах
+            draw.circle(surface, (80, 30, 20), (px, py), self.radius)
+            draw.circle(surface, GUN_TIP,      (px, py), self.radius, 3)
+
+        # ── Оружие поверх спрайта ──
+        # Ствол: толстая тёмная линия + тонкая средняя
+        gx = self.x + sx + math.cos(self.angle) * 28
+        gy = self.y + sy + math.sin(self.angle) * 28
+        draw.line(surface, GUN_DARK, (px, py), (int(gx), int(gy)), 7)
+        draw.line(surface, GUN_MID,  (px, py), (int(gx), int(gy)), 4)
+        # Дуло — красный кружок
+        vx = self.x + sx + math.cos(self.angle) * (self.radius - 4)
+        vy = self.y + sy + math.sin(self.angle) * (self.radius - 4)
+        draw.circle(surface, GUN_TIP,  (int(vx), int(vy)), 6)
+        draw.circle(surface, (255, 120, 100), (int(vx), int(vy)), 3)
 
         self.bubble.draw(surface, self.x + self.shake_x, self.y + self.shake_y)
 
